@@ -105,7 +105,6 @@ from .stopping_criteria import (
 )
 from .streamers import MultiBeamBaseStreamer
 
-from .streamers import MultiBeamBaseStreamer
 
 if TYPE_CHECKING:
     from ..modeling_utils import PreTrainedModel
