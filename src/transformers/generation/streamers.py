@@ -12,10 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import asyncio
 from queue import Queue
-from typing import TYPE_CHECKING, Optional
+import asyncio
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
+
+import torch
 
 
 if TYPE_CHECKING:
@@ -33,6 +34,31 @@ class BaseStreamer:
 
     def end(self):
         """Function that is called by `.generate()` to signal the end of generation"""
+        raise NotImplementedError()
+
+
+class MultiBeamBaseStreamer(BaseStreamer):
+    """
+    Base class from which all multi-beam streamers should inherit.
+    Extends the BaseStreamer class with functionality specific to handling multiple beams.
+    """
+
+    def __init__(self, num_beams: int):
+        super().__init__()
+        if not isinstance(num_beams, int) or num_beams <= 0:
+            raise ValueError(f"num_beams must be a positive integer, got {num_beams}")
+        self.num_beams = num_beams
+        self.current_beam = 0
+
+    def beam_finished(self, beam_idx: int):
+        """
+        Called when a specific beam has finished generating.
+        Must be implemented by the derived class.
+
+        Args:
+            beam_idx (`int`):
+                Index of the beam that finished generating.
+        """
         raise NotImplementedError()
 
 
@@ -226,6 +252,167 @@ class TextIteratorStreamer(TextStreamer):
             raise StopIteration()
         else:
             return value
+
+
+class MultiBeamTextStreamer(MultiBeamBaseStreamer):
+    """
+    A generic text streamer that supports beam search and manages multiple beam outputs
+    through user-defined handlers.
+
+    Args:
+        tokenizer (AutoTokenizer): The tokenizer used to decode the tokens.
+        num_beams (int): Number of beams to handle.
+        on_beam_update (Callable[[int, str], None]): Handler called when a beam's text is updated, gets the beam number
+            and the generated text so far.
+        on_beam_finished (Callable[[int, str], None]): Optional handler called when a beam is reached to EOS token, gets
+            the text of this finished beam.
+        skip_prompt (bool, optional): Whether to skip the prompt tokens. Defaults to True.
+        decode_kwargs (dict, optional): Additional arguments to pass to the tokenizer's decode method.
+    """
+
+    def __init__(
+        self,
+        tokenizer: "AutoTokenizer",
+        num_beams: int,
+        on_beam_update: Callable[[int, str], None],
+        on_beam_finished: Callable[[str], None] = None,
+        skip_prompt: bool = True,
+        **decode_kwargs,
+    ):
+        super().__init__(num_beams)
+        self.tokenizer = tokenizer
+        self.num_beams = num_beams
+        self.skip_prompt = skip_prompt
+        self.decode_kwargs = decode_kwargs
+        self.on_beam_update = on_beam_update
+        self.on_beam_finished = on_beam_finished
+
+        # Initialize storage for each beam
+        self.beam_tokens: Dict[int, List[int]] = {i: [] for i in range(num_beams)}
+        self.beam_texts: Dict[int, str] = {i: "" for i in range(num_beams)}
+        self.beam_print_lens: Dict[int, int] = {i: 0 for i in range(num_beams)}
+
+        # Track beam states at each position
+        self.beam_history: Dict[int, Dict[int, List[int]]] = {}  # position -> beam_idx -> tokens
+        self.current_position = 0
+
+        # Track current state
+        self.next_tokens_are_prompt = True
+
+        # Store finished beams
+        self.finished_beams: List[str] = []
+
+    def _switch_beam_content(self, position: int, previous_beam_idx: int, new_beam_idx: int):
+        """
+        Internal helper to handle beam content switching with position tracking.
+        """
+        if new_beam_idx >= self.num_beams:
+            raise ValueError(f"Beam index {new_beam_idx} is out of range (num_beams={self.num_beams})")
+
+        if previous_beam_idx != new_beam_idx:
+            # Get the correct historical state for the previous beam at this position
+            if position > 0 and position in self.beam_history:
+                source_tokens = self.beam_history[position][previous_beam_idx].copy()
+            else:
+                source_tokens = self.beam_tokens[previous_beam_idx].copy()
+
+            # Update tokens for the new beam
+            self.beam_tokens[new_beam_idx] = source_tokens
+
+            # Update text and calculate new state
+            text = self.tokenizer.decode(source_tokens, **self.decode_kwargs)
+            self.beam_texts[new_beam_idx] = text
+            self.beam_print_lens[new_beam_idx] = len(text)
+
+            # Notify handler of the beam update
+            self.on_beam_update(new_beam_idx, text)
+
+    def put(self, values, beam_indices=None):
+        """
+        Handle new tokens for all beams at once.
+        Args:
+            values: Tensor of shape (num_beams, 1) containing the next token for each beam
+            beam_indices: Optional tensor containing the previous beam indices for each current beam
+        """
+        if len(values.shape) != 2:
+            raise ValueError("Expected values to have shape (num_beams, 1)")
+
+        if values.shape[0] > self.num_beams:
+            raise ValueError(
+                f"Number of beams in values ({values.shape[0]}) exceeds initialized num_beams ({self.num_beams})"
+            )
+
+        if beam_indices is None:
+            # Create a tensor of indices from 0 to num_beams-1 on the same device as values
+            beam_indices = torch.arange(values.shape[0], device=values.device)
+
+        if self.skip_prompt and self.next_tokens_are_prompt:
+            self.next_tokens_are_prompt = False
+            return
+
+        # Save current state before modifications
+        current_state = {beam_idx: self.beam_tokens[beam_idx].copy() for beam_idx in range(self.num_beams)}
+        self.beam_history[self.current_position] = current_state
+
+        # Handle beam switching
+        for i in range(len(beam_indices)):
+            self._switch_beam_content(self.current_position, beam_indices[i].item(), i)
+
+        # Iterate through each beam
+        for beam_idx in range(values.shape[0]):
+            # Get token for current beam
+            value = values[beam_idx]
+
+            # Add new tokens to current beam
+            self.beam_tokens[beam_idx].extend(value.tolist())
+
+            # Decode the entire sequence for current beam
+            text = self.tokenizer.decode(self.beam_tokens[beam_idx], **self.decode_kwargs)
+
+            # Update beam text and calculate printable portion
+            self.beam_texts[beam_idx] = text
+            self.beam_print_lens[beam_idx] = len(text)
+
+            # Notify handler of the beam update with new text
+            self.on_beam_update(beam_idx, text)
+
+        self.current_position += 1
+
+    def beam_finished(self, beam_idx: int):
+        """Mark a beam as finished and notify the handler."""
+        if beam_idx in self.beam_texts:
+            self.finished_beams.append(self.beam_texts[beam_idx])
+
+            # Notify handler that the beam is finished
+            if self.on_beam_finished:
+                self.on_beam_finished(self.finished_beams[-1])
+
+    def end(self):
+        """Finish streaming and handle any remaining beams."""
+        try:
+            # Clean up all beam-related storage
+            self.beam_tokens.clear()
+            self.beam_texts.clear()
+            self.beam_print_lens.clear()
+            self.finished_beams.clear()
+
+            # Clean up position tracking
+            self.beam_history.clear()
+            self.current_position = 0
+
+            # Reset state variables
+            self.next_tokens_are_prompt = True
+
+            # Reinitialize storage for potential reuse
+            self.beam_tokens = {i: [] for i in range(self.num_beams)}
+            self.beam_texts = {i: "" for i in range(self.num_beams)}
+            self.beam_print_lens = {i: 0 for i in range(self.num_beams)}
+            self.finished_beams = {}
+            self.beam_history = {}
+
+        except Exception as e:
+            print(f"Error during cleanup: {str(e)}")
+            raise
 
 
 class AsyncTextIteratorStreamer(TextStreamer):
